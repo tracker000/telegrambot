@@ -1,434 +1,437 @@
 """
-Telegram İhale Botu · Async · PTB v22 · OpenAI 1.x
-Python 3.11+ · Tek dosya
---------------------------------------------------
-Abone olunan anahtar kelimelere göre Contracts Finder ihale bildirimleri
-+ 48 saat kala hatırlatma + GPT-4o özetleme + admin komutları
+GPT-4o destekli Telegram ihale bildirim botu
+Tek dosya sürümü — python-telegram-bot 22.x
 """
 
-from __future__ import annotations
-
-import asyncio
+# ── Standart / harici kütüphaneler ──────────────────────────────────────────────
 import logging
 import os
 import re
 import shutil
-import sys
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, List
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 
-import aiohttp
-import aiosqlite
 import feedparser
+import openai
+import requests
+import sqlite3
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.constants import ParseMode
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
 )
-from telegram.helpers import escape_markdown
 
-# ──────────────────────────── Konfig & Ortam ────────────────────────────────
-BASE_DIR = Path(__file__).parent
-load_dotenv(BASE_DIR / ".env")  # .env otomatik
-
+# ── .env & sabitler ────────────────────────────────────────────────────────────
+load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").split(",") if x}
-FEED_URL = os.getenv(
-    "FEED_URL",
-    "https://www.contractsfinder.service.gov.uk/Published/Notices/Rss",
-)
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
 
-DB_FILE = BASE_DIR / "bot.db"
-BACKUP_DIR = BASE_DIR / "backup"
-BACKUP_DIR.mkdir(exist_ok=True)
+FEED_URL = "https://www.contractsfinder.service.gov.uk/Published/Notices/Rss"
+DB_FILE = "bot.db"
+BACKUP_DIR = "backup"
+LOG_DIR = "log"
+CACHE_DIR = "cache"
 
-FETCH_INTERVAL = 3600      # s – feed poll
-REMINDER_LOOKAHEAD = 48    # h – reminder penceresi
-REMINDER_SCAN_EVERY = 1800 # s
-BACKUP_INTERVAL = 86400    # s
-HEALTH_INTERVAL = 43200    # s
+os.makedirs(BACKUP_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ──────────────────────────── Logging ───────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[
-        logging.FileHandler(BASE_DIR / "bot.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("tenderbot")
-
-# ──────────────────────────── OpenAI Ayarı ───────────────────────────────────
-try:
-    import openai  # type: ignore
-
-    openai.api_key = OPENAI_KEY
-except ImportError:
-    log.warning("openai paketi bulunamadı; özetler metin kısaltmasıyla döner")
-    openai = None  # type: ignore
-
-# ──────────────────────────── SQLite Şeması ─────────────────────────────────
-DDL = """
-PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS subscriptions (
-    user_id INTEGER,
-    keyword TEXT,
-    PRIMARY KEY (user_id, keyword)
-);
-
-CREATE TABLE IF NOT EXISTS tenders (
-    id TEXT PRIMARY KEY,
-    title TEXT,
-    link TEXT,
-    published_utc TEXT,
-    closing_utc TEXT,
-    summary_html TEXT
-);
-
-CREATE TABLE IF NOT EXISTS sent (
-    user_id INTEGER,
-    tender_id TEXT,
-    kind TEXT,     -- 'notify' | 'reminder'
-    PRIMARY KEY (user_id, tender_id, kind)
-);
-"""
+# ── Yardımcı işlevler ──────────────────────────────────────────────────────────
+def format_date(dt: datetime) -> str:
+    months_tr = {
+        "January": "Ocak",
+        "February": "Şubat",
+        "March": "Mart",
+        "April": "Nisan",
+        "May": "Mayıs",
+        "June": "Haziran",
+        "July": "Temmuz",
+        "August": "Ağustos",
+        "September": "Eylül",
+        "October": "Ekim",
+        "November": "Kasım",
+        "December": "Aralık",
+    }
+    return f"{dt.day} {months_tr.get(dt.strftime('%B'), dt.strftime('%B'))} {dt.year}"
 
 
-async def db_exec(sql: str, params: tuple = (), fetch: bool = False):
-    """Lightweight wrapper for aiosqlite queries."""
-    async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute(sql, params)
-        await db.commit()
-        if fetch:
-            return await cur.fetchall()
-        return None
+# ── Veritabanı katmanı ─────────────────────────────────────────────────────────
+def db_conn():
+    return sqlite3.connect(DB_FILE)
 
 
-async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.executescript(DDL)
-        await db.commit()
+def init_db():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS users (chat_id INTEGER PRIMARY KEY, joined_at TEXT)"
+        )
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS subs (chat_id INTEGER, keyword TEXT, last_seen TEXT, PRIMARY KEY(chat_id, keyword))"
+        )
+        conn.commit()
 
 
-# ──────────────────────────── Yardımcılar ───────────────────────────────────
-md = lambda t: escape_markdown(t, version=2)
-is_admin = lambda uid: uid in ADMIN_IDS
+def add_user(chat_id: int):
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (chat_id, joined_at) VALUES (?, ?)",
+            (chat_id, datetime.now().isoformat()),
+        )
 
-CLOSE_RE = re.compile(r"Closing date:? *(\d{1,2} \w+ \d{4})", re.I)
+
+def user_exists(chat_id: int) -> bool:
+    with db_conn() as conn:
+        cur = conn.execute("SELECT 1 FROM users WHERE chat_id=?", (chat_id,))
+        return cur.fetchone() is not None
 
 
-async def fetch_openai_summary(html: str) -> str:
-    """GPT-4o özet; hata veya anahtar yoksa kısa fallback."""
-    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)[:1000]
-    if not openai or not OPENAI_KEY:
-        return "ℹ️ GPT özetleme devre dışı.\n" + text[:200] + " …"
+def add_subscription(chat_id: int, keyword: str) -> bool:
     try:
-        resp = await openai.ChatCompletion.acreate(
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO subs (chat_id, keyword, last_seen) VALUES (?, ?, ?)",
+                (chat_id, keyword, "1970-01-01T00:00:00"),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def remove_subscription(chat_id: int, keyword: str) -> bool:
+    with db_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM subs WHERE chat_id=? AND keyword=?", (chat_id, keyword)
+        )
+        return cur.rowcount > 0
+
+
+def list_subscriptions(chat_id: int):
+    with db_conn() as conn:
+        cur = conn.execute("SELECT keyword FROM subs WHERE chat_id=?", (chat_id,))
+        return [row[0] for row in cur.fetchall()]
+
+
+def clear_subscriptions(chat_id: int):
+    with db_conn() as conn:
+        conn.execute("DELETE FROM subs WHERE chat_id=?", (chat_id,))
+
+
+def get_all_subscriptions():
+    with db_conn() as conn:
+        cur = conn.execute("SELECT chat_id, keyword, last_seen FROM subs")
+        return cur.fetchall()
+
+
+def update_last_seen(chat_id: int, keyword: str, timestamp: str):
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE subs SET last_seen=? WHERE chat_id=? AND keyword=?",
+            (timestamp, chat_id, keyword),
+        )
+
+
+# ── Feed çekme & ayrıştırma ────────────────────────────────────────────────────
+def fetch_feed_entries():
+    try:
+        resp = requests.get(FEED_URL, timeout=10)
+        resp.raise_for_status()
+    except Exception:
+        resp = requests.get(FEED_URL, verify=False, timeout=10)
+    feed = feedparser.parse(resp.text)
+    entries = []
+    for e in feed.entries:
+        entry = {
+            "id": e.get("id", e.get("link")),
+            "title": e.get("title", "").strip(),
+            "link": e.get("link"),
+            "summary": re.sub("<[^<]+?>", "", e.get("summary", "")),
+            "published_parsed": getattr(e, "published_parsed", None),
+            "updated_parsed": getattr(e, "updated_parsed", None),
+            "closing_datetime": None,
+            "budget": None,
+            "pdf_link": None,
+        }
+
+        soup = BeautifulSoup(e.get("summary", ""), "html.parser")
+        text = soup.get_text()
+
+        # Son başvuru tarihi
+        m = re.search(r"(\d{1,2} [A-Za-z]+ \d{4}(?: \d{1,2}:\d{2})?)", text)
+        if m:
+            for fmt in ("%d %B %Y %H:%M", "%d %B %Y"):
+                try:
+                    entry["closing_datetime"] = datetime.strptime(m.group(1), fmt)
+                    break
+                except ValueError:
+                    continue
+
+        # Bütçe
+        m2 = re.search(r"£([0-9,]+)", text)
+        if m2:
+            entry["budget"] = m2.group(1).replace(",", "")
+
+        # PDF link
+        for l in e.get("links", []):
+            if l.get("type") == "application/pdf":
+                entry["pdf_link"] = l.get("href")
+                break
+        if not entry["pdf_link"]:
+            a = soup.find("a", href=True, text=re.compile(r"PDF", re.I))
+            if a:
+                entry["pdf_link"] = a["href"]
+
+        entries.append(entry)
+    return entries
+
+
+# ── GPT-4o özetleme (cache’li) ────────────────────────────────────────────────
+def get_summary(text: str) -> str:
+    content = BeautifulSoup(text, "html.parser").get_text()[:1000]
+    cache_id = str(abs(hash(content)))
+    cache_file = os.path.join(CACHE_DIR, cache_id + ".txt")
+    if os.path.exists(cache_file):
+        return open(cache_file, "r", encoding="utf-8").read()
+
+    prompt = (
+        "Aşağıdaki kamu ihalesini teknik jargon kullanmadan, kritik bilgileri vurgulayarak "
+        "2–3 cümleyle özetle:\n"
+        + content
+    )
+    try:
+        resp = openai.ChatCompletion.create(
             model="gpt-4o",
-            max_tokens=120,
             messages=[
-                {"role": "system", "content": "İhale özetleri"},
-                {"role": "user", "content": text},
+                {"role": "system", "content": "İhale özetleri yazan asistan."},
+                {"role": "user", "content": prompt},
             ],
         )
-        return resp.choices[0].message.content.strip()
-    except Exception as exc:
-        log.error("OpenAI hatası: %s", exc)
-        return "⚠️ Özetleme başarısız.\n" + text[:200] + " …"
+        summary = resp.choices[0].message.content.strip()
+    except Exception:
+        summary = content[:120] + "…"
+
+    with open(cache_file, "w", encoding="utf-8") as f:
+        f.write(summary)
+    return summary
 
 
-async def get_subscriptions_map() -> Dict[str, List[int]]:
-    """keyword -> [user_id, ...]"""
-    rows = await db_exec("SELECT user_id, keyword FROM subscriptions", fetch=True)
-    subs: Dict[str, List[int]] = {}
-    for uid, kw in rows:
-        subs.setdefault(kw, []).append(uid)
-    return subs
+# ── Mesaj biçimlendirme ────────────────────────────────────────────────────────
+def build_message(entry: dict, summary: str, keyword: str, updated: bool = False):
+    title = entry["title"] + (" (Güncellendi)" if updated else "")
+    lines = [
+        f"📝 *{title}*",
+        f"🧾 {summary}",
+    ]
 
-
-async def record_and_send(
-    tender: Dict[str, Any],
-    users: List[int],
-    kind: str,
-    ctx: ContextTypes.DEFAULT_TYPE,
-):
-    """Send message if not already sent."""
-    for uid in users:
-        exists = await db_exec(
-            "SELECT 1 FROM sent WHERE user_id=? AND tender_id=? AND kind=?",
-            (uid, tender["id"], kind),
-            fetch=True,
+    if entry["published_parsed"]:
+        lines.append(
+            f"📅 Yayın: {format_date(datetime(*entry['published_parsed'][:6]))}  "
         )
-        if exists:
-            continue
+    if entry["closing_datetime"]:
+        lines.append(f"⏳ Son Başvuru: {format_date(entry['closing_datetime'])}  ")
+    if entry["budget"]:
+        lines.append(f"💰 Bütçe: £{entry['budget']}  ")
+    if entry["pdf_link"]:
+        lines.append(f"📎 Belgeler: [Şartname PDF]({entry['pdf_link']})")
 
-        if kind == "notify":
-            summary = await fetch_openai_summary(tender["summary_html"])
-            text = (
-                f"📝 *{md(tender['title'])}*\n"
-                f"🧾 {md(summary)}\n"
-                f"🔗 {tender['link']}"
-            )
-        else:  # reminder
-            text = (
-                f"⏰ *{md(tender['title'])}*\n"
-                f"48 saatten az kaldı!\n"
-                f"🔗 {tender['link']}"
-            )
+    lines.extend(
+        [
+            f"🔍 Eşleşen kelime: {keyword}",
+            f"🔗 [İhaleyi Görüntüle]({entry['link']})",
+        ]
+    )
+    text = "\n".join(lines)
+    buttons = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Uygun", callback_data=f"suit:{entry['id']}"),
+                InlineKeyboardButton("❌ Alakasız", callback_data=f"unsuit:{entry['id']}"),
+            ]
+        ]
+    )
+    return text, buttons
 
-        try:
-            await ctx.bot.send_message(
-                uid,
-                text,
-                parse_mode=ParseMode.MARKDOWN_V2,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            log.warning("Mesaj gönderilemedi uid=%s: %s", uid, e)
 
-        await db_exec(
-            "INSERT INTO sent VALUES (?,?,?)", (uid, tender["id"], kind)
+# ── Logging ────────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "bot.log"), maxBytes=5 * 1024 * 1024, backupCount=2
+)
+handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(handler)
+
+
+# ── Telegram komutları ─────────────────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if not user_exists(cid):
+        add_user(cid)
+        msg = (
+            "Hoş geldiniz! /subscribe <kelimeler> komutuyla ihale anahtar kelimeleri ekleyin."
         )
+        logger.info("New user %s registered.", cid)
+    else:
+        msg = "Zaten kayıtlısınız. /help ile komutları görebilirsiniz."
+    await update.message.reply_text(msg)
 
 
-# ──────────────────────────── Komut Fonksiyonları ────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hoş geldiniz! `/subscribe <kelime>` yazarak abone olun.",
-        parse_mode="Markdown",
+        "/start – Başlat\n"
+        "/subscribe <k1 k2 …> – Kelimelere abone ol (max 5 kelime)\n"
+        "/unsubscribe <k> – Abonelik sil\n"
+        "/list – Abonelikleri göster\n"
+        "/clear – Tüm abonelikleri sil"
     )
 
 
-async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Kelime?")
-    keyword = " ".join(ctx.args).lower()
-    await db_exec(
-        "INSERT OR IGNORE INTO subscriptions VALUES (?,?)",
-        (update.effective_user.id, keyword),
-    )
-    await update.message.reply_text(f"'{keyword}' için abone oldunuz.")
-
-
-async def cmd_unsubscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        return await update.message.reply_text("Kelime?")
-    keyword = " ".join(ctx.args).lower()
-    await db_exec(
-        "DELETE FROM subscriptions WHERE user_id=? AND keyword=?",
-        (update.effective_user.id, keyword),
-    )
-    await update.message.reply_text(f"'{keyword}' aboneliğiniz silindi.")
-
-
-async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = await db_exec(
-        "SELECT keyword FROM subscriptions WHERE user_id=?",
-        (update.effective_user.id,),
-        fetch=True,
-    )
-    txt = "\n".join(f"- {kw}" for (kw,) in rows) or "Abonelik yok."
-    await update.message.reply_text(txt)
-
-
-# ─────────────── Admin: /stats /push /backup ────────────────────────────────
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    words = [w.lower() for w in context.args]
+    if not words:
+        await update.message.reply_text("En az bir kelime girin.")
         return
-    users = (await db_exec("SELECT COUNT(DISTINCT user_id) FROM subscriptions", fetch=True))[0][0]
-    subs = (await db_exec("SELECT COUNT(*) FROM subscriptions", fetch=True))[0][0]
-    tenders = (await db_exec("SELECT COUNT(*) FROM tenders", fetch=True))[0][0]
+    if len(words) > 5:
+        await update.message.reply_text("En fazla 5 kelime girebilirsiniz.")
+        return
+    current = list_subscriptions(cid)
+    if len(current) + len(words) > 5:
+        await update.message.reply_text("Toplam abonelik sınırı 5.")
+        return
+    added = [w for w in words if add_subscription(cid, w)]
     await update.message.reply_text(
-        f"👥 {users} kullanıcı\n🔑 {subs} abonelik\n📂 {tenders} ihale"
+        "Abone olunanlar: " + (", ".join(added) if added else "Hiçbiri (zaten kayıtlı).")
     )
 
 
-async def cmd_push(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("Silmek istediğiniz kelimeyi yazın.")
         return
-    if not ctx.args:
-        return await update.message.reply_text("/push <mesaj>")
-    msg = " ".join(ctx.args)
-    rows = await db_exec("SELECT DISTINCT user_id FROM subscriptions", fetch=True)
-    for (uid,) in rows:
-        try:
-            await ctx.bot.send_message(uid, msg)
-        except Exception as e:
-            log.warning("Push fail %s: %s", uid, e)
-    await update.message.reply_text("Toplu mesaj gönderildi ✔️")
+    word = context.args[0].lower()
+    ok = remove_subscription(cid, word)
+    await update.message.reply_text(
+        f"{'Silindi' if ok else 'Bulunamadı'}: {word}"
+    )
 
 
-async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    dest = BACKUP_DIR / f"bot_manual_{datetime.now():%Y%m%d_%H%M%S}.db"
-    await asyncio.to_thread(shutil.copy, DB_FILE, dest)
-    await update.message.reply_text(f"Yedek alındı: {dest.name}")
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    subs = list_subscriptions(cid)
+    await update.message.reply_text(
+        "Abonelikleriniz: " + (", ".join(subs) if subs else "Yok")
+    )
 
 
-# ───────────────────────── Callback (inline buton) ───────────────────────────
-async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Kullanıcı geri bildirimi alındı."""
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    clear_subscriptions(cid)
+    await update.message.reply_text("Tüm abonelikler silindi.")
+
+
+async def cb_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("Geri bildiriminiz kaydedildi ✔️", show_alert=False)
+    await query.answer()
+    cid = query.message.chat.id
+    choice, _ = query.data.split(":")
+    logger.info("User %s clicked %s", cid, choice)
 
 
-# ───────────────────────────── Job’lar ───────────────────────────────────────
-async def parse_feed() -> List[Dict[str, Any]]:
-    """RSS feed’i indirir ve parse eder."""
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(FEED_URL, timeout=20) as resp:
-            raw = await resp.read()
-    feed = feedparser.parse(raw)
-    items: List[Dict[str, Any]] = []
-    for e in feed.entries:
-        tid = e.get("id") or e.get("link")
-        if not tid:
-            continue
-        title = e.get("title", "Başlık yok")
-        link = e.get("link", "")
-        published = (
-            datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-            if e.get("published_parsed")
-            else datetime.now(timezone.utc)
-        )
-        summary = e.get("summary", "")
-        closing = None
-        if (m := CLOSE_RE.search(summary)):
-            try:
-                closing = datetime.strptime(m.group(1), "%d %B %Y").replace(
-                    tzinfo=timezone.utc
-                )
-            except ValueError:
-                pass
-        items.append(
-            dict(
-                id=tid,
-                title=title,
-                link=link,
-                published=published,
-                closing=closing,
-                summary_html=summary,
-            )
-        )
-    return items
-
-
-async def job_fetch(ctx: ContextTypes.DEFAULT_TYPE):
-    """Yeni ihale verilerini çek ve bildirim gönder."""
+# ── Arka plan işler ────────────────────────────────────────────────────────────
+async def job_fetch(context: ContextTypes.DEFAULT_TYPE):
     try:
-        entries = await parse_feed()
-        if not entries:
-            return
+        entries = fetch_feed_entries()
+        subs = get_all_subscriptions()
+        now = datetime.now()
 
-        subs_map = await get_subscriptions_map()
-
-        for tender in entries:
-            await db_exec(
-                "INSERT OR IGNORE INTO tenders VALUES (?,?,?,?,?,?)",
-                (
-                    tender["id"],
-                    tender["title"],
-                    tender["link"],
-                    tender["published"].isoformat(),
-                    tender["closing"].isoformat() if tender["closing"] else None,
-                    tender["summary_html"],
-                ),
+        for e in entries:
+            pub_dt = datetime(*e["published_parsed"][:6]) if e["published_parsed"] else now
+            upd_dt = (
+                datetime(*e["updated_parsed"][:6])
+                if e["updated_parsed"]
+                else pub_dt
             )
 
-            # ilk bildirim
-            lower_title = tender["title"].lower()
-            for kw, users in subs_map.items():
-                if kw in lower_title:
-                    await record_and_send(tender, users, "notify", ctx)
+            for cid, kw, last_seen in subs:
+                if kw not in (e["title"] + e["summary"]).lower():
+                    continue
+                last_dt = datetime.fromisoformat(last_seen)
+                is_new = pub_dt > last_dt
+                is_upd = upd_dt > last_dt and upd_dt != pub_dt
+                if is_new or is_upd:
+                    summary = get_summary(e["summary"])
+                    txt, btn = build_message(e, summary, kw, is_upd)
+                    await context.bot.send_message(
+                        cid, txt, parse_mode="Markdown", reply_markup=btn
+                    )
+                    update_last_seen(cid, kw, (upd_dt if is_upd else pub_dt).isoformat())
 
-        log.info("job_fetch: %s kayıt işlendi", len(entries))
+                # 48 saat kala hatırlatma
+                if e["closing_datetime"]:
+                    if (
+                        last_dt < e["closing_datetime"] - timedelta(hours=48) <= now
+                    ):  # henüz bildirilmediyse
+                        summary = get_summary(e["summary"])
+                        txt, btn = build_message(
+                            e,
+                            summary
+                            + "\n⏰ *Hatırlatma: Son başvuruya 48 saat kaldı!*",
+                            kw,
+                        )
+                        await context.bot.send_message(
+                            cid, txt, parse_mode="Markdown", reply_markup=btn
+                        )
+                        update_last_seen(
+                            cid, kw, e["closing_datetime"].isoformat()
+                        )
     except Exception as exc:
-        log.exception("job_fetch hata: %s", exc)
+        logger.error("fetch job error: %s", exc, exc_info=True)
 
 
-async def job_reminder(ctx: ContextTypes.DEFAULT_TYPE):
-    """Kapanışa 48 ±1 saat kalan ihaleler için hatırlatma gönder."""
+async def job_backup(context: ContextTypes.DEFAULT_TYPE):
     try:
-        now = datetime.now(timezone.utc)
-        win_start = (now + timedelta(hours=REMINDER_LOOKAHEAD - 1)).isoformat()
-        win_end = (now + timedelta(hours=REMINDER_LOOKAHEAD)).isoformat()
-        rows = await db_exec(
-            """
-            SELECT id, title, link, summary_html
-            FROM tenders
-            WHERE closing_utc BETWEEN ? AND ?
-            """,
-            (win_start, win_end),
-            fetch=True,
-        )
-        if not rows:
-            return
-        subs_map = await get_subscriptions_map()
-        for tid, title, link, summary_html in rows:
-            tender = dict(id=tid, title=title, link=link, summary_html=summary_html)
-            await record_and_send(tender, sum(subs_map.values(), []), "reminder", ctx)
-        log.info("job_reminder: %s ihale", len(rows))
+        if os.path.exists(DB_FILE):
+            dst = os.path.join(
+                BACKUP_DIR, f"bot_{datetime.now():%Y%m%d_%H%M%S}.db"
+            )
+            shutil.copy(DB_FILE, dst)
+            logger.info("DB backed up.")
     except Exception as exc:
-        log.exception("job_reminder hata: %s", exc)
+        logger.error("backup job error: %s", exc, exc_info=True)
 
 
-async def job_backup(_ctx: ContextTypes.DEFAULT_TYPE):
-    dest = BACKUP_DIR / f"bot_{datetime.now():%Y%m%d_%H%M%S}.db"
-    await asyncio.to_thread(shutil.copy, DB_FILE, dest)
-    log.info("DB yedeği: %s", dest)
-
-
-async def job_health(_ctx: ContextTypes.DEFAULT_TYPE):
-    log.info("Health ping OK")
-
-
-# ───────────────────────────── main ──────────────────────────────────────────
-async def main():
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN zorunlu")
-    if not ADMIN_IDS:
-        log.warning("ADMIN_ID tanımlanmadı; admin komutları pasif")
-
-    await init_db()
+# ── main() ─────────────────────────────────────────────────────────────────────
+def main():
+    init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Kullanıcı komutları
+    # Komutlar
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CallbackQueryHandler(cb_buttons))
 
-    # Admin komutları
-    app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("push", cmd_push))
-    app.add_handler(CommandHandler("backup", cmd_backup))
-
-    app.add_handler(CallbackQueryHandler(on_callback))
-
-    # Job’lar
+    # İşler
     jq = app.job_queue
-    jq.run_repeating(job_fetch, FETCH_INTERVAL, first=10)
-    jq.run_repeating(job_reminder, REMINDER_SCAN_EVERY, first=600)
-    jq.run_repeating(job_backup, BACKUP_INTERVAL, first=120)
-    jq.run_repeating(job_health, HEALTH_INTERVAL, first=60)
+    jq.run_repeating(job_fetch, interval=600, first=10)
+    jq.run_daily(job_backup, time=datetime.now().time().replace(hour=0, minute=0))
 
-    log.info("Bot başladı…")
-    await app.run_polling(stop_signals=None)
+    logger.info("Bot started.")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Çıkılıyor…")
+    main()
+
+
